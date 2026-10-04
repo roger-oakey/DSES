@@ -192,9 +192,12 @@ GP8630N_MAX_STEPS   = 65535.0 # Number of steps that correspond to 10 Volts expr
 #
 # Copley (azimuth) motor definitione and control
 #
-COPLEY_STOP_TIME = 1 # Stop time in seconds
+# Start time is amount of times in seconds that it takes before we can detect
+# the axis is moving, or is stopping how long until it stops.
+#
+COPLEY_START_TIME = 2 # Stop time in seconds
 # Movement speeds in degrees / second
-COPLEY_SLEW_RATES = (-0.4, -0.1, 0, 0.1, 0.4) # Slew speeds in degrees/second
+COPLEY_SLEW_RATES = (0.1, 0.4) # Slew speeds in degrees/second
 # Shift distances are stop distance and slow down to home in distance
 COPLEY_SHIFT_DISTANCES = (0.05, 1)
 # Poll times are seconds between polling for speeds stopped, homing in and slew
@@ -203,9 +206,12 @@ COPLEY_POLL_TIMES = (5, 0.1, 1)
 #
 # Allen Bradley (elevation) definitions and control
 #
-ALLEN_BRADLEY_STOP_TIME = 1 # Stop time in seconds
+# Start time is amount of times in seconds that it takes before we can detect
+# the axis is moving, or is stopping how long until it stops.
+#
+ALLEN_BRADLEY_START_TIME = 2 # Stop time in seconds
 # Movement speeds in degrees / second
-ALLEN_BRADLEY_SLEW_RATES = (-0.2, -0.1, 0, 0.1, 0.2) # Slew speeds in degrees/second
+ALLEN_BRADLEY_SLEW_RATES = (0.1, 0.2) # Slew speeds in degrees/second
 # Shift distances are stop distance and slow down to home in distance
 ALLEN_BRADLEY_SHIFT_DISTANCES = (0.05, 0.5)
 # Poll times are seconds between polling for speeds stopped, homing in and slew
@@ -245,11 +251,6 @@ VFDrelay = None
 AZenable = None
 ELup = None
 ELdown = None
-
-#
-# Initialize I2C synchronization lock
-#
-i2cLock = threading.Lock()
 
 #
 # Initialie the encoders to an invalid value
@@ -583,10 +584,7 @@ class Encoder():
     
     def progress(self):
         #
-        # The call to progress is the only time we really interrogate the
-        # encoder. All calls after this to "position" only return the value
-        # determined when progress was called. This is to keep the encoders
-        # from being swamped with network calls.
+        # Return how we're moving. -1, 0 or +1
         #
         return(sign(self.current_position -  self.last_position))
 
@@ -807,13 +805,8 @@ class MOTOR_CONTROL_GENERIC():
             self._off()
 
             #
-            # Record speed as now zero
-            #
-            self.last_speed = 0
-
-            #
             # The [speed + self.max_speed] converts the speed, for example -2,
-            # -1, 1 or 2 to an index range starting at 0.
+            # -1, 0, 1 or 2 to an index range starting at 0.
             #
             self.DAC.voltage(self.voltages[speed + self.max_speed])
         else:
@@ -847,23 +840,29 @@ class MOTOR_CONTROL_GENERIC():
             # Turn relay on to start the dish moving
             #
             self._on(speed)
-            self.last_speed = speed
         
         #
-        # Now wait around for up to two seconds to see the new direction set
-        # reflected in the actual movement as reported by the encoders. In other
-        # words, wait around here until the physical world of moving the dish
-        # catches up with this computer...
+        # Save the speed you just set as the last_speed
         #
-        # Use the smallest delay, divide it into 2 seconds and wait that many
-        # loops to see if it sarts moving before the timeout.
+        self.last_speed = speed
+        
         #
-        loops = int((2.0 / self.pollDelay[1]) + 0.5)
-        for _ in range(0, loops):
+        # Now wait around for a limited time to see the new direction just set
+        # is reflected in the actual movement as reported by the encoders. To
+        # "debounce" you must get two in a row in the correct direction.
+        # 
+        # In other words, wait around here until the physical world of moving
+        # the dish catches up with this computer...
+        #
+        # Get the current, real position
+        #
+        self.encoder.get_position()
+        sameDirectionTwoInARow = False
+        for _ in range(0, self.startAttempts):
             #
-            # Shortest delay each time around the loop
+            # Short delay each time around the loop
             #
-            time.sleep(self.pollDelay[1])
+            time.sleep(self.startPollDelay)
 
             #
             # Update the real position
@@ -872,9 +871,14 @@ class MOTOR_CONTROL_GENERIC():
             progress = self.encoder.progress()
             if (sign(speed) == progress):
                 #
-                # We have movement in the correct direction, return
+                # We have movement in the correct direction, see if this is two
+                # in a row...
                 #
-                return
+                if (sameDirectionTwoInARow):
+                    return
+                sameDirectionTwoInARow = True
+            else:
+                sameDirectionTwoInARow = False
             
         #
         # We fell through the wait loop which means that movement isn't matching
@@ -924,7 +928,8 @@ but moving in a {display_movement(progress)} direction"""
         self.destination = destination
         degrees = destination - self.encoder.position()
         #
-        # Given distance in degrees, compute the speed to move that many drgrees
+        # Given distance in degrees, compute the speed to move that many
+        # dergrees
         #
         for speed in range(self.max_speed):
             if (abs(degrees) <= self.shiftPoints[speed]):
@@ -954,37 +959,17 @@ but moving in a {display_movement(progress)} direction"""
     
         #
         # Find out how much time to destination at top speed by dividing its
-        # rate in degrees / second into the number of degrees you're away from
-        # the destination.
+        # rate in degrees/second into the number of degrees you're away from
+        # the destination, then add in the feather down time (which includes a
+        # round up to the next second). Change to integer and return.
         #
-        eta = abs(destination - self.encoder.position()) / self.rates[-1]
+        return (int((abs(destination - self.encoder.position()) / self.rates[-1]) + self.featherTime))
 
-        #
-        # Now add in the maximum time that could be spent slewing at the slower
-        # speeds
-        #
-        # Starting with one less than the maximum speed down to the slowest
-        # speed. This is written so it can handle any number of different
-        # speeds.
-        #
-        for _ in range(len(self.rates) - 2, self.max_speed, -1):
-            #
-            # Take this speed in degrees / second and divide into the distance
-            # away from the destination that we'll downshift to this speed and
-            # add it to the eta so far computed.
-            #
-            eta += self.shiftPoints[_ + 1] / self.rates[_]
-
-        #
-        # Round up, change to integer and return the time in seconds.
-        #
-        return (int(eta + 0.5))
-
-    def __init__(self, encoder, DAC, stopTime, rates, shiftPoints, pollDelay):
+    def __init__(self, encoder, DAC, startTime, rates, shiftPoints, pollDelay):
         self.encoder = encoder
         self.name = self.encoder.name
         self.DAC = DAC
-        self.stopTime = stopTime
+        self.startTime = startTime
         self.rates = rates
         self.shiftPoints = shiftPoints
         self.pollDelay = pollDelay
@@ -996,11 +981,39 @@ but moving in a {display_movement(progress)} direction"""
         self.work = queue.Queue()
 
         #
-        # The maximum absolute speed that we can move (0 - n). This list is an
-        # odd length, so a list of 5 would result in a max speed of 2 after
-        # truncation.
+        # Build positive and negative slew rates from the short list
         #
-        self.max_speed = int(len(rates) / 2)
+        # Changes rates of (.1, 1) to (-1.0, -0.1, 0, .1, 1.0) for example
+        self.rates = []
+        for _ in reversed(rates):
+            self.rates.append(-_)
+        self.rates.append(0.0)
+        for _ in rates:
+            self.rates.append(_)
+        
+        #
+        # Change to tuple to assure it's not changed and for a little gain in
+        # access speed
+        #
+        self.rates = tuple(self.rates)
+
+        #
+        # The maximum absolute speed that we can move (0 - n). Determined by the
+        # number of slew rates supplied.
+        #
+        self.max_speed = len(rates)
+
+        #
+        # Now figure out the "feather down" time - the maximum amount of time
+        # we'll spend slowing down to less-than-maximum-speed and stopping.
+        #
+        self.featherTime = 0
+        for _ in range(self.max_speed - 1):
+            self.featherTime += shiftPoints[ _ + 1] / rates[_]
+        #
+        # Add in another secondd to integer up.
+        #
+        self.featherTime += 1.0
 
         #
         # From the rates, compute the voltages to get those rates.
@@ -1018,11 +1031,24 @@ but moving in a {display_movement(progress)} direction"""
             self.voltages = tuple(tvolts) # Slew rates in voltages
 
         logging.info(f"""{self.name} MOTOR_CONTROL class initializing:
- stopTime = {self.stopTime} second
+ startTime = {self.startTime} second
  rates = {self.rates} per second
  voltages = {self.voltages} (correspond to rates)
  shiftPoints = {self.shiftPoints} degrees away from destination
  pollDelay = {self.pollDelay}""")
+
+        #
+        # Compute the delay time for detecting movement starting or stopping
+        #
+        self.startPollDelay = self.pollDelay[1]
+
+        #
+        # Compute the number of retries waiting for movement to start or stop.
+        # We'll try this many times with a delay of startPollDelay in between
+        # and hopefully get two progress indicators in the desired direction
+        # (-1, 0 or +1).
+        #
+        self.startAttempts = int((self.startTime / self.pollDelay[1]) + 0.5)
 
         #
         # We don't want the speed to be zero, but we do a compare before we set
@@ -1082,7 +1108,7 @@ class MOTOR_CONTROL_COPLEY(MOTOR_CONTROL_GENERIC):
         super().__init__(self,
                          encoder,
                          DAC,
-                         COPLEY_STOP_TIME,
+                         COPLEY_START_TIME,
                          COPLEY_SLEW_RATES,
                          COPLEY_SHIFT_DISTANCES,
                          COPLEY_POLL_TIMES)
@@ -1146,7 +1172,7 @@ class MOTOR_CONTROL_ALLEN_BRADLEY(MOTOR_CONTROL_GENERIC):
         super().__init__(self,
                          encoder,
                          DAC,
-                         ALLEN_BRADLEY_STOP_TIME,
+                         ALLEN_BRADLEY_START_TIME,
                          ALLEN_BRADLEY_SLEW_RATES,
                          ALLEN_BRADLEY_SHIFT_DISTANCES,
                          ALLEN_BRADLEY_POLL_TIMES)
@@ -1163,7 +1189,7 @@ class MOTOR_CONTROL_ALLEN_BRADLEY(MOTOR_CONTROL_GENERIC):
 ################################################################################
 ################################################################################
 
-def AxisControl(work_queue, motor, encoder):
+def AxisControl(motor):
     global first_detected_error
 
     logging.info(f'{motor.name} AxisControl thread starting')
@@ -1180,7 +1206,7 @@ def AxisControl(work_queue, motor, encoder):
     poll_interval = 5
 
     #
-    # Rnn as long as we're not aborting
+    # Run as long as we're not aborting
     #
     while (not first_detected_error):
         try:
@@ -1188,7 +1214,7 @@ def AxisControl(work_queue, motor, encoder):
             # Blocks for a short time to keep from banging on the encoder, then
             # sees if there's work to be done.
             #
-            work = work_queue.get(block=True, timeout=poll_interval)
+            (work, callback) = motor.queue.get(block=True, timeout=poll_interval)
             logging.info(f'{motor.name} work received: {work}')
 
         except queue.Empty:
@@ -1196,9 +1222,13 @@ def AxisControl(work_queue, motor, encoder):
         
         if (first_detected_error):
             #
-            # Abort flag was set while waiting, exit this thread
+            # Critical error encountered while waiting on queue, return
             #
             logging.critical(f'Abort detected, {motor.name} AxisControl thread exiting')
+            if (callback):
+                #
+                # If there's a callback routine, call it.
+                callback()
             return
         #
         # Here's our special call to get_position which will cause us to get the
@@ -1256,54 +1286,87 @@ def AxisControl(work_queue, motor, encoder):
             continue
 
         #
-        # Everything is hunky-dory, let's see if we have work to do
+        # Everything is hunky-dory, let's see if we have work to do. If we just
+        # times out then work is None, which is False.
         #
-
-        #
-        # See if we have stop work
-        #
-        if (work is not None):
+        if (work):
+            #
+            # Work to do, see if it's STOP work or a new destination
+            #
             if (work == STOP):
                 #
                 # Set destination to the current position, which will cause
                 # setDestination to determine that we've arrived at our
                 # destination and stop the dish.
                 #
-                destination = encoder.position()
+                motor.setDestination(motor.encoder.position())
 
+                #
+                # Make the destination EXACTLY what the last encoder
+                # position was to assure we don't move anymore.
+                #
+                destination = motor.encoder.position()
             else:
                 #
                 # The only other work is a new destination, set it
                 #
-                (destination, event) = work
+                destination = work
+                motor.setDestination(destination)
+            
+            #
+            # We've either stopped the dish or we've started it on its way
+            # to the destination. Call the callback routine to signal our
+            # work is done.
+            #
+            if (callback):
+                callback()
 
         #
-        # Set the destination. This will set an appropriate speed and direction
-        # to the destination, depending on the distance to the destination from
-        # the current position. This will also stop the motor if we've arrived
-        # at the destination (speed of zero)
+        # No work to do, or we started work. Just set the destination again to
+        # see if we need to slow down or stop. The poll_interval returned will
+        # detemine just how long we can sleep (a long time if stopped), a short
+        # time if we're "feathering in" on the destination.
         #
-        # Compute distance and direction to the destination
+        # Set the correct motor speed and get the next polling interval, then
+        # go back and wait for new work for the polling interval time.
         #
         poll_interval = motor.setDestination(destination)
 
-        #
-        # Special code for STOP. Since STOP does not feather down to a stop,
-        # it's possible that we overshoot enough to cause the dish's position
-        # to be far enough away from the destination that it'll back up. We
-        # don't want that, so for STOP, once everything is stopped grab the
-        # current position (refresh by calling get_position) and set the
-        # destination to the current position to make sure we stay stopped.
-        #
-        if (work == STOP):
-            destination = motor.encoder.get_position()
-
-            #
-            # Release any process waiting on the axis to change motion
-            #
-            event.set()
-
     logging.critical(f'Abort detected, {motor.name} AxisControl thread exiting')
+    
+    #
+    # Critical error encountered while waiting on queue, return
+    #
+    logging.critical(f'Abort detected, {motor.name} AxisControl thread exiting')
+    if (callback):
+        #
+        # If there's a callback routine, call it.
+        callback()
+
+
+def AxisControlWait(motor, work):
+
+    #
+    # Setup event flag
+    #
+    commandStarted = threading.Event()
+
+    def callback():
+        #
+        # Signal event flag to unblock this function
+        #
+        commandStarted.set()
+
+    #
+    # Queue the work and wait for it to start
+    #
+    motor.queue.put((work, callback))
+    commandStarted.wait()
+
+    #
+    # Return to calling program
+    #
+
 
 def EMERGENCY_STOP(text=None):
 
@@ -1346,30 +1409,33 @@ def EMERGENCY_STOP(text=None):
         first_detected_error = text
 
 def POWER_ON():
-    global AZqueue, ELqueue
+    global AZmotor, ELmotor
     
-    # Mke sure everything is stopped
-    ELqueue.put(STOP)
-    AZqueue.put(STOP)
+    #
+    # Queue "STOP" work to both axis
+    #
+    AxisControlWait(ELmotor, STOP)
+    AxisControlWait(AZmotor, STOP)
 
     # Allow everything to stop and settle down, then turn on the power
     sleep(5)
     VFDrelay.close()
 
 def POWER_OFF():
-    global AZqueue, ELqueue
-    ELqueue.put(STOP)
-    AZqueue.put(STOP)
+    global AZmotor, ELmotor
+    
+    #
+    # Queue "STOP" work to both axis
+    #
+    AxisControlWait(ELmotor, STOP)
+    AxisControlWait(AZmotor, STOP)
 
-    # Allow everything to stop, then power stuff off.
-    sleep(5)
+    # Now power everything off
     VFDrelay.open()
 
 def display_movement(value):
     return (["-", "0", "+"][value + 1])
 
-manualPos = re.compile(r'(\+{1,2})')
-manualNeg = re.compile(r'(-{1,2})')
 azNumber = re.compile(r'([\+-]?\d{1,3}\.\d{0,3}|[\+-]?\d{0,3}\.\d{1,3})')
 
 ################################################################################
@@ -1389,175 +1455,82 @@ def warn(text):
 def fatal(text):
     return("FATAL ERROR " + text)
 
-def axisInfo(motor, delay=3):
-
-    #
-    # Sleep three seconds before getting axis information so we can get the
-    # operation statrted so it reflects accurate information.
-    #
-    current_direction = motor.encoder.progress()
+def axisInfo(motor):
 
     #
     # +1 and -1 are printed as they are, 0 becomes " 0" to avoid "+0" for
     # asthetics but keeping the field width the same.
     #
-    current_direction = f'{current_direction:+2d}' if current_direction else " 0"
+    current_direction = motor.currentDirection()
+    current_direction = f'{current_direction():+2d}' if current_direction else " 0"
 
     return(f'OK {motor.encoder.position():+08.3f} {current_direction} {motor.ETA():03d} {motor.destination:+08.3f} {motor.encoder.minimum:+08.3f} {motor.encoder.maximum:+08.3f}')
 
-def azNum(azimuth):
-    global AZqueue, AZmotor
-    
-    azimuth = float(azimuth)
-    if (azimuth < AZIMUTH_MINIMUM):
-        return("Error: Minimum azimuth is {AZIMUTH_MINIMUM}")
-    if (azimuth > AZIMUTH_MAXIMUM):
-        return("Error: Maximum azimuth is {AZIMUTH_MAXIMUM}")
+movePos = re.compile(r'(\+{1,2})$')
+moveNeg = re.compile(r'(-{1,2})$')
+moveDegrees = re.compile(r'([\+-]?\d{1,3}|[\+-]?\d{1,3}\.\d{0,3}|[\+-]?\d{0,2}\.\d{1,3})$')
+
+def moveDegrees(motor, position, speed_limit=None):
 
     #
-    # Setup lock that will blcok until the dish has stated moving in order to
-    # report valid information
+    # Not using the speed limit yet
     #
-    axis_moving = threading.Event()
 
-    #
-    # Queue the work to start the axis moving
-    #
-    AZqueue.put((azimuth, axis_moving))
-
-    #
-    # Block until the axis is moving.
-    #
-    axis_moving.wait()
+    position = float(position) # Valid because the string was screened by the RE
+    if (position < motor.encoder.minimum):
+        return(f"Error: Invalid position specified, minimum is {motor.encoder.minimum}")
+    if (position > motor.encoder.maximum):
+        return(f"Error: Invalid position specified, maximum is {motor.encoder.maximum}")
 
     #
-    # Now return information about the axis
+    # Queue the work to start the axis moving and wait until you can see the
+    # dish actually moving which means the axisInfo call will return something
+    # accurate!
     #
-    return (axisInfo(AZmotor))
-
-def azPos(speed):
-
-    # Not using the speed yet.
-    return(azNum(AZIMUTH_MAXIMUM))
-
-def azNeg(speed):
-
-    # Not using the speed yet.
-    return(azNum(AZIMUTH_MINIMUM))
-
-azParse = {
-    manualPos : azPos,
-    manualNeg : azNeg,
-    azNumber : azNum
-}
-
-def CMDazimuth(token):
-    global AZmotor, AZqueue
-
-    if (len(token) > 1):
-        #
-        # Only zero or one tokens can be supplied to the AZIMUTH command
-        #
-        return ('Error: Too many arguments specifed to the "AZIMUTH" command')
-
-    if (not token):
-        #
-        # There is nothing but the "AZIMUTH" command - return the current
-        # azimuth and motion.
-        #
-        return (axisInfo(AZmotor, 0))
-
-    #
-    # We have one token, get rid of the list.
-    #
-    token = token[0]
-
-    if (token == "STOP"[:len(token)]):
-        #
-        # Stop detected
-        #
-        AZqueue.put(STOP)
-        return (axisInfo(AZmotor))
-
-    #
-    # Now go looking for a match for the azimuth command argument
-    #
-    for regEx, dispatch in azParse.items():
-        match = regEx.match(token)
-        if (match):
-            return(dispatch(match.group(1)))
-
-    #
-    # We should always find a match in the above for loop. If not, we have a
-    # command syntax error.
-    #
-    return ("Error: Unrecognized argument to AZIMUTH command")
-
-elNumber = re.compile(r'([\+-]?\d{1,2}\.\d{0,3}|[\+-]?\d{0,2}\.\d{1,3})')
-
-def elNum(elevation):
-    global ELqueue, ELmotor
-
-    elevation = float(elevation)
-    if (elevation < ELEVATION_MINIMUM):
-        return("Error: Minimum Elevation is {AZIMUTH_MINIMUM}")
-    if (elevation > ELEVATION_MAXIMUM):
-        return("Error: Maximum Elevation is {AZIMUTH_MAXIMUM}")
-
-    
-
-    #
-    # Setup lock that will blcok until the dish has stated moving in order to
-    # report valid information
-    #
-    axis_moving = threading.Event()
-
-    #
-    # Queue the work to start the axis moving
-    #
-    ELqueue.put((elevation, axis_moving))
-
-    #
-    # Block until the axis is moving.
-    #
-    axis_moving.wait()
+    AxisControlWait(motor, position)
 
     #
     # Now return information about the axis
     #
     return (axisInfo(ELmotor))
 
-def elPos(speed):
+def moveManual(motor, speed):
 
-    # Not using the speed yet.
-    return(elNum(ELEVATION_MAXIMUM))
+    #
+    # Determine direction and speed
+    #
+    if (speed[0] == "+"):
+        #
+        # It's a "+", move up to the maximum degrees or until stopped
+        #
+        return(movDegrees(motor, motor.encoder.maximum, len(speed)))
+    
+    #
+    # If not "+", it's minus, move up to the minimum degrees or until stopped
+    #
+    return(movDegrees(motor, motor.encoder.minimum, len(speed)))
 
-def elNeg(speed):
+moveManualRE = re.compile(r'(-{1,2}|\+{1,2})$')
+moveDegreesRE = re.compile(r'([\+-]?\d{1,3}|[\+-]?\d{1,3}\.\d{0,3}|[\+-]?\d{0,2}\.\d{1,3})$')
 
-    # Not using the speed yet.
-    return(elNum(ELEVATION_MINIMUM))
-
-elParse = {
-    manualPos : elPos,
-    manualNeg : elNeg,
-    elNumber : elNum
+moveParse = {
+    moveManualRE : moveManual,
+    movDegreesRE : moveDegrees
 }
 
-def CMDelevation(token):
-    global ELmotor, ELqueue
+def CMDaxis(motor, token):
+
     if (len(token) > 1):
         #
         # Only zero or one tokens can be supplied to the AZIMUTH command
         #
-        return ('Error: Too many arguments specifed to the "ELEVATION" command')
+        return (f'Error: Too many arguments specifed to the "{motor.name.upper()}" command')
 
     if (not token):
         #
-        # There is nothing but the "ELEVATION" command - return the current
-        # elevation and motion. A call to progress will update the position to
-        # the current position. Do not delay, immediately get the position.
+        # Blank axis command - return the current axis position and motion.
         #
-        return (axisInfo(ELmotor, 0))
+        return (axisInfo(motor))
 
     #
     # We have one token, get rid of the list.
@@ -1566,47 +1539,53 @@ def CMDelevation(token):
 
     if (token == "STOP"[:len(token)]):
         #
-        # Stop detected
+        # Stop detected, stop the axis and wait for the dish to come to a stop
+        # before returning the axisInfo to make it valid.
         #
-        ELqueue.put(STOP)
-        return (axisInfo(ELmotor))
+        AxisControlWait(motor, STOP)
+        return (axisInfo(motor))
 
     #
-    # Now go looking for a match for the elevation command argument
+    # Now go looking for a match for the axis command argument
     #
-    for regEx, dispatch in elParse.items():
+    for regEx, dispatch in moveParse.items():
         match = regEx.match(token)
         if (match):
-            return(dispatch(match.group(1)))
+            return(motor, dispatch(match.group(1)))
 
     #
     # We should always find a match in the above for loop. If not, we have a
     # command syntax error.
     #
-    return ("Error: Unrecognized argument to ELEVATION command")
+    return (f"Error: Unrecognized argument to "{motor.name.upper()}" command")
 
-def CMDhelp(tokens, az, el):
+def CMDhelp(az, el, token):
     return(HELP_TEXT)
 
-def CMDstop(az, el):
-    global AZqueue, ELqueue
+def CMDstop(az, el, token):
+    global AZmotor, ELmotor
     #
     # Stop both azimuth and elevation axes
     #
-    el.work.put(STOP)
-    az.work.put(STOP)
+    ELmotor.queue.put((STOP, None))
+    AZmotor.queue.put((STOP, None))
+
+    #
+    # Because we're not returning any information, we don't have to wait for the
+    # command to start, just put it in the queues and return "OK".
+    #
     return("OK")
 
 
 commands = {
-    "AZIMUTH" : CMDazimuth,
-    "ELEVATION" : CMDelevation,
+    "AZIMUTH" : CMDaxis,
+    "ELEVATION" : CMDaxis,
     "HELP" : CMDhelp,
-    "STOP" : CMDstop,
+    STOP : CMDstop,
     "?" : CMDhelp
 }
 
-def parseCommand(cmd, az, el):
+def parseCommand(az, el, cmd):
 
     dispatchList = list()
     for command, dispatch in commands.items():
@@ -1618,6 +1597,7 @@ def parseCommand(cmd, az, el):
             # This command was a match, save it in the dispatch list
             #
             dispatchList.append(dispatch)
+            full_command = command
 
     if (not dispatchList):
         #
@@ -1629,13 +1609,29 @@ def parseCommand(cmd, az, el):
         #
         # More than one command matched
         #
-        return(f'Error: "{cmd[0]}" ambiguous, specify more letters. Try "HELP" or "?"')
+        return(f'Error: "{cmd[0]}" ambiguous command, specify more letters. Try "HELP" or "?"')
     
     #
     # One command matched, dispatch to its parsing routine with the rest of the
     # arguments, if any. Once complete, return the text returned from it.
     #
-    return(dispatch(az, el, cmd[1:]))
+    if (full_command == "AZIMUTH"):
+        #
+        # It's an azimuth command, call the movement distaptch fucntion with
+        # the azimuth motor
+        #
+        return(dispatch[0](az, cmd[1:]))
+    elif (full_command == "ELEVATION"):
+        #
+        # It's an elevation command, call the movement distaptch fucntion with
+        # the elevation motor
+        #
+        return(dispatch[0](el, cmd[1:]))
+    
+    #
+    # Not an AZIMUTH or ELEVATION command, dispatch to the command
+    #
+    return(dispatch[0](az, el, cmd[1:]))
 
 ################################################################################
 ################################################################################
@@ -1689,7 +1685,7 @@ def getCommands(az, el):
                 #
                 # We have some command to parse, parse it.
                 #
-                results = parseCommand(splitUp, az, el)
+                results = parseCommand(az, el, splitUp)
             else:
                 #
                 # Blank line, just return nothing back (keepalive method?)
@@ -1755,6 +1751,11 @@ def getCommands(az, el):
 
 def main():
     global VFDrelay, AZenable, ELup, ELdown, first_detected_error
+
+    #
+    # Initialize I2C synchronization lock
+    #
+    i2cLock = threading.Lock()
 
     VFDrelay = RELAY("VFD", VFD_RELAY)
 
