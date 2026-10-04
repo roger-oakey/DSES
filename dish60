@@ -1,0 +1,1884 @@
+#!/usr/bin/python
+
+from datetime import datetime
+import glob
+from gpiozero import OutputDevice, InputDevice
+import logging
+from pymodbus.client import ModbusTcpClient
+import os
+from pathlib import Path
+import queue
+import re
+from smbus2 import SMBus
+import socket
+import sys
+import threading
+from time import sleep
+
+FILE_NAME =  str(Path(__file__).resolve())
+
+#
+# Only keep the last five log files around, delete the rest
+#
+log_files = glob.glob(FILE_NAME + ".log.*")
+log_files.sort()
+for old_file in (set(log_files) ^ set(log_files[-5:])):
+    os.remove(old_file)
+
+#
+# Setup logging to a file and the console
+#
+logging.basicConfig(
+    filename = FILE_NAME + f".log.{datetime.now():%y%m%d_%H%M%S}",
+    filemode = "w", # 'w' overwrites the file; 'a' appends (default)
+    format   = "%(asctime)s - %(levelname)-8s : %(message)s",
+    level    = logging.DEBUG)
+
+console = logging.StreamHandler()
+console.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(levelname)-8s : %(message)s')
+# tell the handler to use this format
+console.setFormatter(formatter)
+# add the handler to the root logger
+logging.getLogger().addHandler(console)
+
+HELP_TEXT = """
+
+A summary of commands supported by the Dish Server. Character case is ignored.
+
+"AZIMUTH" commands can have the following form:
+
+    <no arguments>
+
+        Returns current azimuth information in the following format:
+
+        "OK ±ccc.ccc DD sss ±ddd.ddd ±mmm.mmm ±xxx.xxx"
+
+        "OK": Standard success text.
+
+        "±ccc.ccc": Current position, always preceded by a "+" or "-".
+
+        "DD": Current motion. "-1" if the azimuth is decreasing, "+1" if the
+            azimuth is increasing and " 0" if stopped.
+
+        "sss": Estimated number of seconds until the destination is reached
+            (000 if stopped/current motion is " 0")
+
+        "±ddd.ddd": Destination always preceded by a "+" or "-". If stopped
+            (current motion " 0") the destination will be within the
+            positioning error of the current position.
+
+        "±mmm.mmm": Minimum value that can be specified for the azimuth,
+            always preceded by a "+" or "-".
+
+        "±xxx.xxx": Maximum value that can be specified for the azimuth,
+            always preceded by a "+" or "-".
+
+        Examples:
+            OK +037.552 +1 287 +275.355 -015.000 +375.000
+            OK +255.473 -1 015 +250.555 -015.000 +375.000
+            OK -012.337  0 000 -012.355 -015.000 +375.000
+
+    AZIMUTH +
+    AZIMUTH ++
+
+        Move azimuth in an increasing azimuth direction either slowly (-) or
+        quickly (--). Note: During movement initiated by this command, the
+        destination will show the maximum azimuth that can be specified. The
+        successful response to this command is (see explanation above):
+
+            "OK ±ccc.ccc DD sss ±ddd.ddd ±mmm.mmm ±xxx.xxx"
+
+    AZIMUTH -
+    AZIMUTH --
+
+        Move azimuth in an decreasing azimuth direction either slowly (-) or
+        quickly (--). Note: During movement initiated by this command, the
+        destination will show the minimum azimuth that can be specified. The
+        successful response to this command is (see explanation above):
+        
+            "OK ±ccc.ccc DD sss ±ddd.ddd ±mmm.mmm ±xxx.xxx"
+
+    AZIMUTH ±ddd.ddd
+
+        This command will move the antenna to the specified azimuth. Where
+        ±ddd.ddd will specify the destination. The specified destination
+        format is flexible, the "+" can be omitted as well as leading or
+        trailing zeroes. The successful response to this command is (see
+        explanation above):
+        
+            "OK ±ccc.ccc DD sss ±ddd.ddd ±mmm.mmm ±xxx.xxx"
+
+    AZIMUTH STOP
+
+        Stop azimuth movement right where it is immediately. The successful
+        response to this command is (see format above):
+        
+            "OK ±ccc.ccc  0 000 ±ddd.ddd ±mmm.mmm ±xxx.xxx"
+            (where ccc.ccc and ddd.ddd will be within the magin of error)
+
+"ELEVATION" commands follow the exact same form as the azimuth commands, above.
+
+    Example responses:
+
+        OK +037.552 +1 130 +097.355 +000.000 +090.000
+        OK +040.473 -1 015 +035.555 +000.000 +090.000
+        OK +012.337  0 000 +012.355 +000.000 +090.000
+
+"HELP" or "?" command
+
+    This help text
+
+"STOP"
+
+    "STOP" will stop both the azimuth and elevation motors immediately.
+
+    Response:
+        "OK"
+"""
+
+#
+# Dish server socket
+#
+SOCKET = 55845
+
+#
+# Relay definitions
+#
+RELAY_SETTLE = 0.02 # 20 ms for the relay contacts to stop bouncing
+
+VFD_COIL    = 21 # Variable Frequency Drive enable pin
+VFD_SENSE   = 25 # Variable Frequency Drive sense pin
+VFD_RELAY   = (VFD_COIL, VFD_SENSE)
+
+AZ_COIL     = 20 # Azimuth relay energize pin
+AZ_SENSE    = 24 # Azimuth relay sense pin
+AZ_RELAY    = (AZ_COIL, AZ_SENSE)
+
+ELUP_COIL   = 12 # Elevation up relay energize pin
+ELUP_SENSE  = 18 # Elevation up relay sense pin
+ELUP_RELAY  = (ELUP_COIL, ELUP_SENSE)
+ELDN_COIL   = 16 # Elevation down relay energize pin
+ELDN_SENSE  = 23 # Elevation down relay sense pin
+ELDN_RELAY  = (ELDN_COIL, ELDN_SENSE)
+
+#
+# N25 encoder information
+#
+ENCODER_N25_STEPS   =  65536 # Number of steps per rev on the N25 encoder
+ENCODER_N25_AMBIGUOUS_ZONE = 20.0
+ENCODER_N25_ZONE_MAX = 360.0 - ENCODER_N25_AMBIGUOUS_ZONE
+ENCODER_N25_ZONE_MIN = ENCODER_N25_AMBIGUOUS_ZONE
+
+ENCODER_AZIMUTH_IP = "192.168.1.243" # Static IP of azimuth encoder
+ENCODER_AZIMUTH_PORT = 502
+
+ENCODER_ELEVATION_IP = "192.168.1.244" # Static IP of elevation encoder
+ENCODER_ELEVATION_PORT = 502
+
+#
+# Definitions for a DFROBOT Gravity GP8630N DAC devices
+#
+GP8630N_AZIMUTH_I2C     = 0x58 # I2C bus address of azimuth DAC
+GP8630N_ELEVATION_I2C   = 0x59 # I2C bus address of elevation DAC
+
+GP8630N_PREAMBLE        = 0x01 # Byte 0 of DAC I2C command
+GP8630N_OPCODE_PLUS10V  = 0x1c # Byte 1 of DAC I2C command, 0 - 10V opcode
+GP8630N_OPCODE_MINUS10V = 0x14 # Byte 1 of DAC I2C command, 0 - -10V opcode
+
+GP8630N_MAX_VOLTAGE = 10.0    # MAximum voltage that DAC can generate is 10 volts, +-
+GP8630N_MAX_STEPS   = 65535.0 # Number of steps that correspond to 10 Volts expressed as a floating value
+
+#
+# Copley (azimuth) motor definitione and control
+#
+COPLEY_STOP_TIME = 1 # Stop time in seconds
+# Movement speeds in degrees / second
+COPLEY_SLEW_RATES = (-0.4, -0.1, 0, 0.1, 0.4) # Slew speeds in degrees/second
+# Shift distances are stop distance and slow down to home in distance
+COPLEY_SHIFT_DISTANCES = (0.05, 1)
+# Poll times are seconds between polling for speeds stopped, homing in and slew
+COPLEY_POLL_TIMES = (5, 0.1, 1)
+
+#
+# Allen Bradley (elevation) definitions and control
+#
+ALLEN_BRADLEY_STOP_TIME = 1 # Stop time in seconds
+# Movement speeds in degrees / second
+ALLEN_BRADLEY_SLEW_RATES = (-0.2, -0.1, 0, 0.1, 0.2) # Slew speeds in degrees/second
+# Shift distances are stop distance and slow down to home in distance
+ALLEN_BRADLEY_SHIFT_DISTANCES = (0.05, 0.5)
+# Poll times are seconds between polling for speeds stopped, homing in and slew
+ALLEN_BRADLEY_POLL_TIMES = (5, 0.1, 1)
+
+#
+# Azimuth definitions
+#
+AZIMUTH_MAXIMUM = 375.0
+AZIMUTH_MINIMUM = -15.0
+AZIMUTH_EXCURSION_ERROR = 1.0 # Excursion error once 1 degree exceeded
+AZIMUTH_ADJUSTMENT = 32468
+
+#
+# Elevation definitions
+#
+ELEVATION_MAXIMUM = 90.0
+ELEVATION_MINIMUM = 0.0
+ELEVATION_EXCURSION_ERROR = 1.0 # Excursion error once 1 degree exceeded
+ELEVATION_ADJUSTMENT = 16958
+
+#
+# Azimuth and elevation stop command
+#
+STOP = "STOP"
+
+################################################################################
+#
+# Runtime global variables
+#
+first_detected_error = None
+#
+# Define some variables here as None (False) so the big hammer (EMERGENCY_STOP)
+# won't crash accessing them.
+#
+VFDrelay = None
+AZenable = None
+ELup = None
+ELdown = None
+
+#
+# Initialize I2C synchronization lock
+#
+i2cLock = threading.Lock()
+
+#
+# Initialie the encoders to an invalid value
+#
+AZmotor = None
+ELmotor = None
+
+################################################################################
+
+#
+# Dish simualtor code
+#
+simulator = len(sys.argv) > 1
+if (simulator):
+    logging.critical("Running dish simulator")
+    ENCODER_AZIMUTH_IP = socket.gethostbyname("DishSimulator")
+    ENCODER_AZIMUTH_PORT = 5020
+    ENCODER_ELEVATION_IP = ENCODER_AZIMUTH_IP
+    ENCODER_ELEVATION_PORT = 5021
+
+################################################################################
+################################################################################
+#
+# N25 encoder hardware interface
+#
+################################################################################
+################################################################################
+
+class ENCODER_NR25:
+    #
+    # Advanced Micro Controls, Inc. NR25 Networked Resolver
+    # file:///O:/DSES/DishDrive/MyDrive/NR25-ethernet-rotary-encoder_-_0D094.pdf
+    #
+    # Single revolution, 65536 steps.
+    #
+    # Modbus 16 bit registers read:
+    #   0/1 32 bit scaled value
+    #   2/3 32 bit velocity data
+    #   4/5 32 bit raw position value
+    #   6/7 32 bit time stamp data (400ns ticks since power on, rolls over every
+    #                               28 minutes))
+    #
+    def _steps(self):
+
+        #
+        # Try reading the encoder 5 times before giving up
+        #
+        for i in range(5):
+            #
+            # Read 1 holding register starting at address 0 (slave/unit ID defaults to 1)
+            #
+            try:
+                result = self.encoder.read_holding_registers(address=0, count=8)
+
+                if (not result.isError()):
+                    #
+                    # Successful read, return steps. Steps (0-65535) is 16 bit
+                    # word at offset 4. Chanage to an int (32 bits)
+                    #
+                    return(int(result.registers[4]))
+                
+                logging.error(f"{self.name} encoder, Modbus read error occurred: {result}")
+                
+            except Exception as e:
+                logging.exception(f"{self.name} encoder, network connection exception: {e}")
+
+        #
+        # Stop everything and set flag to abort all threads
+        #
+        text = f"{self.name} encoder, unable to read encoder"
+        logging.critical(text)
+        EMERGENCY_STOP(text)
+
+        #
+        # Return 0 angle
+        #
+        return(65536 - self.correction)
+
+    def _adjusted_steps(self):
+        #
+        # Add the correction to the steps read, then modulo the number of steps
+        # to keep it in the 0-65535 range.
+        #
+        return((self._steps() + self.correction) % ENCODER_N25_STEPS)
+
+    def position(self):
+        #
+        # Convert the steps to an angle. Multiply the steps by 360.0 first to
+        # make the division more accurate.
+        #
+        return ((self._adjusted_steps() * 360.0) / ENCODER_N25_STEPS)
+    
+    def __init__(self, name, ip_addr, port, correction):
+        self.name = name
+        self.ip_addr = ip_addr
+        self.port = port
+        self.correction = correction
+
+        logging.info(f"{self.name} encoder hardware initializing: IP {self.ip_addr}, port {self.port} correction {self.correction}")
+
+        #Open a modbus connection to the encoder
+        self.encoder = ModbusTcpClient(host=self.ip_addr, port=self.port)
+        if (not self.encoder.connect()):
+            #
+            # Stop everything and set flag to abort all threads
+            #
+            text = f"{self.name} encoder, connection to {self.ip_addr}, {self.port} failed"
+            logging.critical(text)
+            EMERGENCY_STOP(text)
+
+class AzimuthEncoder():
+
+    def __ambiguous_zone(self, degrees):
+        #
+        # This will determine if you're in the ambigious zone
+        #
+        # See if currently in ambiguous zone
+        if (degrees >= ENCODER_N25_ZONE_MAX):
+            return (1)
+        if (degrees <= ENCODER_N25_ZONE_MIN):
+            return(-1)
+        return(0)
+
+    def __get_ambiguous(self):
+        #
+        # This will read the ambiguous file that has the value -1, 0 or 1 in it
+        # to save the ambiguous state when shut down. It will also set
+        # self.ambiguous to the current value.
+        #
+        try:
+            with open(self.ambiguous_filename, "r", encoding="utf-8") as file:
+                self.ambiguous = int(file.read())
+                return
+
+        except Exception as e:
+            logging.exception(f'Exception when trying to read "{self.ambiguous_filename}", {e}')
+            text = f'Unable to read "{self.ambiguous_filename}"'
+            logging.critical(text)
+            EMERGENCY_STOP(text)
+            self.ambiguous = 0
+
+    def __put_ambiguous(self, zone):
+        #
+        # This will write the ambiguous file with the value of -1, 0 or 1
+        # depending on what zone you're in. It will also set self.ambiguous
+        # to the current value.
+        try:
+            with open(self.ambiguous_filename, "w", encoding="utf-8") as file:
+                file.write(f'{zone}')
+                self.ambiguous = zone
+                return
+
+        except Exception as e:
+            logging.exception(f'Exception when trying to write "{self.ambiguous_filename}", {e}')
+            text = f'Unable to write "{self.ambiguous_filename}"'
+            logging.critical(text)
+            EMERGENCY_STOP(text)
+            self.ambiguous = 0
+
+    def __not_ambiguous(self):
+        #
+        # Save to the ambiguous file that we're not in the ambiguous zone.
+        #
+        self.__put_ambiguous(0)
+
+    def position(self):
+
+        # Get the position using the Encoder position method
+        pos = self.encoder.position()
+
+        # The ambiguous logic is basically edge-triggered. It detects the
+        # transition from the non-ambiguous zone into the ambiguous zone and
+        # "stays" in that zone until it transitions back into the non-ambiguous
+        # zone.
+        # 
+        # If the heading is going up, going beyond a heading of 360 will cause
+        # the heading to continue to climb until it hits the soft stop of 380
+        # degrees (and for the 60 foot dish, it should hard stop before that).
+        # 
+        # If the heading is going down, going beyond a heading of 0 will cause
+        # the heading to go negative, until it hits the soft stop of -20
+        # degrees (and for the 60 foot dish, it should hard stop before that).
+
+        if (self.ambiguous > 0):
+            # We entered the ambiguous zone by going up in heading (positive/CW/
+            # left), so if the encoder gives us degrees less than 180, we're
+            # beyond North (heading 0), so add 360 to the current heading. We'll
+            # be stopped at 15 degrees beyond North (heading 375).
+            if (pos < 180.0):
+                pos += 360.0
+
+            # Now see if we've transitioned OUT of the ambiguous zone. If we're
+            # anywhere (+ or -) in the ambiguous zone, just keep the current
+            # ambiguous information. Otherwise if we've transitioned out of it,
+            # set ambiguous to 0.
+            if (not self.__ambiguous_zone(pos)):
+                self.__not_ambiguous()
+
+        elif (self.ambiguous < 0):
+            # We entered the ambiguous zone by going down in heading
+            # (negative/CCW/right), so if the encoder gives us degrees more than
+            # 180, we're beyond North (heading 0), so subtract 360 from the
+            # current heading. We'll be stopped at -15 degrees beyond North
+            # (heading 345).
+            if (pos > 180.0):
+                pos -= 360.0
+
+            # See if we've transitioned OUT of the ambiguous zone. If we're
+            # anywhere (+ or -) in the ambiguous zone, just keep the current
+            # ambiguous information. Otherwise if we've transitioned out of it,
+            # set ambiguous to 0.
+            if (not self.__ambiguous_zone(pos)):
+                self.__not_ambiguous()
+
+        else:
+            # We were NOT in the ambiguous zone. Determine if we have
+            # transitioned into it by seeing if the current position is IN the
+            # ambiguous zone (1 or -1, both True). If so, save it.
+            new_ambiguous = self.__ambiguous_zone(pos)
+            if (new_ambiguous):
+                self.__put_ambiguous(new_ambiguous)
+        
+        return(pos)
+        
+    def __init__(self, encoder):
+        self.encoder = encoder
+        self.name = self.encoder.name
+        self.ambiguous_filename = FILE_NAME + ".ambiguous"
+
+        logging.info(f"{self.name}Encoder class initializing: Ambiguous filename {self.ambiguous_filename}")
+
+        #
+        # Restore ambiguous state if necessary. Get the current position. If
+        # it's witihin the ambiguous zone, restore the state of the ambiguous
+        # zone.
+        #
+        # REad the current position
+        #
+        amb = self.__ambiguous_zone(self.encoder.position())
+        if (amb):
+            #
+            # The current position puts us in the ambiguous zone. Read the
+            # ambiguous file and see whch side of the zone we're really in.
+
+            self.__get_ambiguous() # Call sets "self.ambigious"
+
+            if (not self.ambiguous):
+                #
+                # According to the file, we not supposed to be in the ambiguous
+                # zone. This is bad becasue we don't know which direction we
+                # came from to get here!
+                #
+                text = f"""We're in the ambiguous zone, but the saved value says we aren't.
+Ambiguous value: {self.ambiguous}, azimuth position: {self.encoder.position()}"""
+                logging.critical(text)
+                EMERGENCY_STOP(text)
+        else:
+            #
+            # We're outside the ambiguous zone, force the ambiguous value to
+            # zero no matter what.
+            #
+            self.__not_ambiguous()
+
+class ElevationEncoder():
+
+    def position(self):
+
+        pos = self.encoder.position()
+
+        if (pos > 225.0):
+            #
+            # Pointing below horizontal is negative
+            #
+            pos -= 360.0
+
+        return(pos)
+
+    def __init__(self, encoder):
+        self.encoder = encoder
+        self.name = self.encoder.name
+
+        logging.info(f"{self.name}Encoder class initializing")
+
+class Encoder():
+
+    def get_position(self):
+        #
+        # Actual call that hits the encoder to determine the current position
+        # of the antenna. This call is broken out so we can use position() to
+        # return the previously fetched position and avoid banging on the
+        # encoders quite so much.
+        #
+        # Save where we were
+        #
+        self.last_position = self.current_position
+
+        #
+        # Now get where we are
+        #
+        self.current_position = self.encoder.position()
+
+        #
+        # Make sure we haven't gone out-of-bounds in either direction!
+        #
+        if (self.current_position > self.maxExcursion):
+            text = f"{self.name} exceeded maxiumm excursion of {self.maximum} ({self.last_position})"
+            logging.critical(text)
+            EMERGENCY_STOP(text)
+
+        if (self.current_position < self.minExcursion):
+            text = f"{self.name} exceeded minimum excursion of {self.minimum} ({self.last_position})"
+            logging.critical(text)
+            EMERGENCY_STOP(text)
+
+        #
+        # Return the current position in case we want to skip a subsequent
+        # positin() call.
+        #
+        return(self.current_position)
+
+    def position(self):
+        #
+        # The call to get_position sets up the value of current_position which
+        # we return from a position call. This is to keep network access to the
+        # encoders down to a dull roar.
+        #
+        # Just make sure you call get_position (if necessary) before actually
+        # calling position to refresh the position!
+        #
+        return(self.current_position)
+    
+    def progress(self):
+        #
+        # The call to progress is the only time we really interrogate the
+        # encoder. All calls after this to "position" only return the value
+        # determined when progress was called. This is to keep the encoders
+        # from being swamped with network calls.
+        #
+        return(sign(self.current_position -  self.last_position))
+
+    def __init__(self, encoder, min, max, excursion):
+        self.encoder = encoder
+        self.name = self.encoder.name
+
+        self.maximum = max
+        self.minimum = min
+        self.maxExcursion = self.maximum + excursion
+        self.minExcursion = self.minimum - excursion
+        
+        logging.info(f"Encoder class for {self.name} initializing: Min {self.minimum}, max {self.maximum}" excursion {excursion})
+
+        #
+        # Get initial position
+        #
+        self._position()
+
+################################################################################
+################################################################################
+#
+# Relay hardware interface
+#
+################################################################################
+################################################################################
+
+class RELAY:
+    
+    def state(self):
+        #
+        # Get the status of the pin. It has been set up for negative logic, so
+        # with the relay closed it's grounded and "True" and if the relay's open
+        # it's pulled high and False.
+        #
+        status = self.sense.is_active
+        logging.debug(f"{self.name} relay state {"ON" if status else "OFF"}")
+        return(status)
+
+    def off(self, debounce=RELAY_SETTLE):
+        logging.debug(f"{self.name} relay turning OFF")
+        self.coil.off()
+        if (debounce):
+            #
+            # If we're verifying that the relay operated correctly, wait for the
+            # contacts to settle, then check.
+            #
+            sleep(debounce)
+            if (self.state()):
+                text = f"{self.name} relay falied to turn OFF"
+                logging.critical(text)
+                EMERGENCY_STOP(text)
+
+    def on(self, debounce=RELAY_SETTLE):
+        logging.debug(f"{self.name} relay turning ON")
+        self.coil.on()
+        if (debounce):
+            #
+            # If we're verifying that the relay operated correctly, wait for the
+            # contacts to settle, then check.
+            #
+            sleep(debounce)
+            if (not self.state()):
+                text = f"{self.name} relay falied to turn ON"
+                logging.critical(text)
+                EMERGENCY_STOP(text)
+
+    def test(self):
+        logging.debug(f"{self.name} relay test")
+
+        #
+        # Always leave the relay in the same state it was before testing
+        #
+        if (self.state()):
+            self.off()
+            self.on()
+        else:
+            self.on()
+            self.off()
+
+    def __init__(self, name, relay):
+        self.name = name
+
+        logging.info(f"{self.name} relay hardware initializing: GPIO pins {relay_pin} (coil) and {sense_pin} (sense)")
+
+        self.coil  = OutputDevice(relay[0], initial_value=False)
+        self.sense = InputDevice(relay[1], pull_up=True)
+
+        sleep(RELAY_SETTLE)
+        if (self.state()):
+            text = f"{self.name} relay was not OFF after initialization"
+            logging.critical(text)
+            EMERGENCY_STOP(text)
+
+################################################################################
+################################################################################
+#
+# DAC hardware interface
+#
+################################################################################
+################################################################################
+
+class DAC_GP8630N:
+    #
+    # DAC control for the gravity GP8630N
+    # https://www.dfrobot.com/product-3074.html
+    #
+
+    def voltage(self, volts):
+
+        if (volts == self.last_volts):
+            #
+            # If no need to change voltage, don't.
+            #
+            return
+        
+        self.last_volts = volts
+
+        if (volts >= 0):
+            opcode = GP8630N_OPCODE_PLUS10V
+        else:
+            opcode = GP8630N_OPCODE_MINUS10V
+
+        logging.info(f"{self.name} DAC setting voltage to {volts}")
+
+        volts = abs(volts)
+
+        if (volts > GP8630N_MAX_VOLTAGE):
+            text = f"""Volts out of range for {self.name} DAC
+Volts specified {volts}, volts maximum is {GP8630N_MAX_VOLTAGE}"""
+            logging.critical(text)
+            EMERGENCY_STOP(text)
+            return
+
+        steps = int(((volts / GP8630N_MAX_VOLTAGE) * GP8630N_MAX_STEPS) + 0.5)
+
+        #
+        # Open and close the I2C bus because more than one device is talking on
+        # it. Take out a lock while doing this so two thread/processes aren't
+        # trying to talk on the I2C bus at the same time.
+        #
+        try:
+            with self.i2c_lock:
+                bus = SMBus(1)
+                bus.write_byte_data(self.address, 0, GP8630N_PREAMBLE)
+                bus.write_byte_data(self.address, 1, opcode)
+                bus.write_word_data(self.address, 2, steps)
+                bus.close()
+        except Exception as e:
+            text = f"{self.name} DAC I2C communication exception: {e}"
+            logging.exception(text)
+            EMERGENCY_STOP(text)
+
+
+    def __init__(self, name, address, i2c_lock):
+        self.name = name
+        self.address = address
+        self.i2c_lock = i2c_lock
+
+        logging.info(f"{self.name} DAC hardware initializing: I2C address 0x{address:x}")
+
+        # Set DAC to zero voltage (a known state) to begin with
+        self.last_volts = None
+        self.voltage(0)
+
+def sign(value):
+    #
+    # Return sign of number in the form of -1, 0 or 1
+    #
+    if (value > 0):
+        return(1)
+
+    if (value < 0):
+        return(-1)
+    
+    return(0)
+
+def reverse(old_speed, new_speed):
+    if (not old_speed):
+        #
+        # Old speed is zero, so we're not changing directions
+        #
+        return (False)
+    
+    #
+    # If signs of old speed and new speed are different, we're reversing.
+    #
+    return (sign(old_speed) != sign(new_speed))
+
+################################################################################
+################################################################################
+#
+# Methods and variables common to both the Copley and the Allen Bradley motor
+# controllers.
+#
+################################################################################
+################################################################################
+
+class MOTOR_CONTROL_GENERIC():
+
+    def currentDirection(self):
+        return(sign(self.last_speed))
+
+    def _motorSpeed(self, speed):
+
+        if (speed == self.last_speed):
+            #
+            # No speed change, nothing to do.
+            #
+            return
+
+        if (not speed):
+            #
+            # Speed requested is zero. Stop the motor
+            #
+            # Turn off the relay(s)
+            #
+            self._off()
+
+            #
+            # Record speed as now zero
+            #
+            self.last_speed = 0
+
+            #
+            # The [speed + self.max_speed] converts the speed, for example -2,
+            # -1, 1 or 2 to an index range starting at 0.
+            #
+            self.DAC.voltage(self.voltages[speed + self.max_speed])
+        else:
+            #
+            # We're setting a new speed, make sure it's a valid one first.
+            #
+            if (abs(speed) > self.max_speed):
+                #
+                # We requested a speed over the maximum number of requested speeds
+                #
+                text = f'{self.name} motor, speed {speed} requested, but speed range is (+-){self.max_speed}'
+                logging.critical(text)
+                EMERGENCY_STOP(text)
+                return
+
+            if (reverse(self.last_speed, speed)):
+                #
+                # If we're reversing, stop first
+                #
+                self._motorSpeed(0)
+
+            #
+            # Convert speed into a voltage and pass to the DAC
+            #
+            # The [speed + self.max_speed] converts the speed, for example -2, -1,
+            # 1 or 2 to an index range starting at 0.
+            #
+            self.DAC.voltage(self.voltages[speed + self.max_speed])
+
+            #
+            # Turn relay on to start the dish moving
+            #
+            self._on(speed)
+            self.last_speed = speed
+        
+        #
+        # Now wait around for up to two seconds to see the new direction set
+        # reflected in the actual movement as reported by the encoders. In other
+        # words, wait around here until the physical world of moving the dish
+        # catches up with this computer...
+        #
+        # Use the smallest delay, divide it into 2 seconds and wait that many
+        # loops to see if it sarts moving before the timeout.
+        #
+        loops = int((2.0 / self.pollDelay[1]) + 0.5)
+        for _ in range(0, loops):
+            #
+            # Shortest delay each time around the loop
+            #
+            time.sleep(self.pollDelay[1])
+
+            #
+            # Update the real position
+            #
+            self.encoder.get_position()
+            progress = self.encoder.progress()
+            if (sign(speed) == progress):
+                #
+                # We have movement in the correct direction, return
+                #
+                return
+            
+        #
+        # We fell through the wait loop which means that movement isn't matching
+        # what we're trying to do! Slam on the brakes.
+        #
+        EMERGENCY_STOP()
+        #
+        # We either moving when we should be stopped, stopped when we should
+        # be moving or we're moving in the wrong direction. Determine which
+        # problem it is, report and abort!
+        #
+        if (speed):
+            #
+            # We either not moving or moving in the opposite direction we
+            # should be, report
+            #
+            if (progress):
+                #
+                # We're moving in the wrong direction
+                #
+                text = f"""{motor.name} after speed change should be moving in a {display_movement(speed)} direction,
+but moving in a {display_movement(progress)} direction"""
+                logging.critical(text)
+            else:
+                #
+                # We're not moving but we should be
+                #
+                text = f'{motor.name} after speed change should be moving in a {display_movement(speed)} direction, but not moving'
+                logging.critical(text)
+        else:
+            #
+            # We're moving when we should be stopped
+            #
+            text = f'{motor.name} after stop should not be moving, but it is moving in a {display_movement(progress)} direction'
+            logging.critical(text)
+
+        #
+        # Abort everythin with a good error message.
+        #
+        EMERGENCY_STOP(text)
+
+    def setDestination(self, destination):
+
+        #
+        #Save destination
+        #
+        self.destination = destination
+        degrees = destination - self.encoder.position()
+        #
+        # Given distance in degrees, compute the speed to move that many drgrees
+        #
+        for speed in range(self.max_speed):
+            if (abs(degrees) <= self.shiftPoints[speed]):
+                #
+                # Distance is less than this speed's shift distance, exit the
+                # loop with this speed determined.
+                #
+                break
+        else:
+            #
+            # Set speed to maximum
+            #
+            speed = self.max_speed
+        
+        #
+        # Move at the computed speed
+        #
+        self._motorSpeed(speed * sign(degrees))
+        return (self.pollDelay[speed])
+
+    def ETA(self):
+        #
+        # If motor stopped, ETA is zero
+        #
+        if (not self.last_speed):
+            return(0)
+    
+        #
+        # Find out how much time to destination at top speed by dividing its
+        # rate in degrees / second into the number of degrees you're away from
+        # the destination.
+        #
+        eta = abs(destination - self.encoder.position()) / self.rates[-1]
+
+        #
+        # Now add in the maximum time that could be spent slewing at the slower
+        # speeds
+        #
+        # Starting with one less than the maximum speed down to the slowest
+        # speed. This is written so it can handle any number of different
+        # speeds.
+        #
+        for _ in range(len(self.rates) - 2, self.max_speed, -1):
+            #
+            # Take this speed in degrees / second and divide into the distance
+            # away from the destination that we'll downshift to this speed and
+            # add it to the eta so far computed.
+            #
+            eta += self.shiftPoints[_ + 1] / self.rates[_]
+
+        #
+        # Round up, change to integer and return the time in seconds.
+        #
+        return (int(eta + 0.5))
+
+    def __init__(self, encoder, DAC, stopTime, rates, shiftPoints, pollDelay):
+        self.encoder = encoder
+        self.name = self.encoder.name
+        self.DAC = DAC
+        self.stopTime = stopTime
+        self.rates = rates
+        self.shiftPoints = shiftPoints
+        self.pollDelay = pollDelay
+        self.progress = 1
+
+        #
+        # Initialize the work queue for this motor.
+        #
+        self.work = queue.Queue()
+
+        #
+        # The maximum absolute speed that we can move (0 - n). This list is an
+        # odd length, so a list of 5 would result in a max speed of 2 after
+        # truncation.
+        #
+        self.max_speed = int(len(rates) / 2)
+
+        #
+        # From the rates, compute the voltages to get those rates.
+        #
+        tvolts = list()
+        for rate in self.rates:
+            tvolts.append(self._rate2volts(rate))
+
+        #
+        # Save as an immutable Tuple
+        #
+        if (simulator):
+            self.voltages = (0, 1, 2, 3) # Slew rates in voltage for simulator
+        else:
+            self.voltages = tuple(tvolts) # Slew rates in voltages
+
+        logging.info(f"""{self.name} MOTOR_CONTROL class initializing:
+ stopTime = {self.stopTime} second
+ rates = {self.rates} per second
+ voltages = {self.voltages} (correspond to rates)
+ shiftPoints = {self.shiftPoints} degrees away from destination
+ pollDelay = {self.pollDelay}""")
+
+        #
+        # We don't want the speed to be zero, but we do a compare before we set
+        # last_speed, so set it to something wild that will assure the != 0 will
+        # be true.
+        #
+        self.last_speed = 100
+
+        #
+        # Alaways stop when initialized and make the destination the same as the
+        # current encoder position.
+        #
+        self.destination = self.encoder.get_position()
+        self._motorSpeed(0)
+
+################################################################################
+################################################################################
+#
+# Copley (azimuth) hardware interface
+#
+################################################################################
+################################################################################
+
+class MOTOR_CONTROL_COPLEY(MOTOR_CONTROL_GENERIC):
+    #
+    # Control of the Azimuth via the Copley controller
+    #
+    def _rate2volts(self, rate):
+        #
+        # If rate is zero, return zero
+        #
+        return((-10.780 * rate) - 0.002 if rate else 0)
+
+    def _off(self):
+            #
+            # Turn the azimuth enable relay off
+            #
+            self.enable.off()
+
+    def _on(self, speed):
+            #
+            # Turn the azimuth enable relay on
+            #
+            self.enable.on()
+
+    def __init__(self, encoder, DAC, enable):
+
+        #
+        # Save a pointer to the Copley enable relay class
+        #
+        self.enable = enable
+
+        #
+        # Initialize the parent class with the stuff that can be handled
+        # generically
+        #
+        super().__init__(self,
+                         encoder,
+                         DAC,
+                         COPLEY_STOP_TIME,
+                         COPLEY_SLEW_RATES,
+                         COPLEY_SHIFT_DISTANCES,
+                         COPLEY_POLL_TIMES)
+
+################################################################################
+################################################################################
+#
+# Allen Bradley (elevation) hardware interface
+#
+################################################################################
+################################################################################
+
+class MOTOR_CONTROL_ALLEN_BRADLEY(MOTOR_CONTROL_GENERIC):
+    #
+    # Control of the Elevation via the Allen Bradley motor controller
+    #
+    def _rate2volts(self, rate):
+        if (not rate):
+            return(0)
+        
+        #
+        # Different rates for + and - directions
+        #
+        if (rate > 0):
+            return((14.368 * rate) - 0.806)
+        return((-14.597 * rate) - 0.868)
+
+    def _off(self):
+            #
+            # Turn both relays off, but turn the active relay off first since
+            # there's a debounce delay in operating the relays, and you want to
+            # turn off the active relay as quickly as possible!
+            #
+            if (self.last_speed > 0):
+                self.UPenable.off()
+                self.DNenable.off()
+            else:
+                self.DNenable.off()
+                self.UPenable.off()
+
+    def _on(self, speed):
+        
+        if (speed > 0):
+            self.UPenable.on()
+        else:
+            self.DNenable.on()
+
+    
+    def __init__(self, encoder, DAC, enable_up, enable_down):
+
+        #
+        # Save the pointers to the Allen Bradley relays
+        #
+        self.UPenable = enable_up # AB up movement relay
+        self.DNenable = enable_down # AB down movement relay
+
+        #
+        # Initialize the parent class with the stuff that can be handled
+        # generically
+        #
+        super().__init__(self,
+                         encoder,
+                         DAC,
+                         ALLEN_BRADLEY_STOP_TIME,
+                         ALLEN_BRADLEY_SLEW_RATES,
+                         ALLEN_BRADLEY_SHIFT_DISTANCES,
+                         ALLEN_BRADLEY_POLL_TIMES)
+        
+
+################################################################################
+################################################################################
+#
+# Same work loop for both azimuth and elevation.
+#
+# Given now-generic motor and encoder interfaces, drive the motor to the
+# destination.
+#
+################################################################################
+################################################################################
+
+def AxisControl(work_queue, motor, encoder):
+    global first_detected_error
+
+    logging.info(f'{motor.name} AxisControl thread starting')
+
+    #
+    # Initilize destination as to wherever we are at the moment. get_position()
+    # reads the encoder and returns the current value.
+    #
+    destination = motor.encoder.get_position()
+
+    #
+    # Start out by monitoring every 5 seconds
+    #
+    poll_interval = 5
+
+    #
+    # Rnn as long as we're not aborting
+    #
+    while (not first_detected_error):
+        try:
+            #
+            # Blocks for a short time to keep from banging on the encoder, then
+            # sees if there's work to be done.
+            #
+            work = work_queue.get(block=True, timeout=poll_interval)
+            logging.info(f'{motor.name} work received: {work}')
+
+        except queue.Empty:
+            work = None
+        
+        if (first_detected_error):
+            #
+            # Abort flag was set while waiting, exit this thread
+            #
+            logging.critical(f'Abort detected, {motor.name} AxisControl thread exiting')
+            return
+        #
+        # Here's our special call to get_position which will cause us to get the
+        # current position of the antenna from the encoder ONCE, then that
+        # position will be used for all other refeences to the antenna's
+        # position.
+        #
+        # This is to reduce banging on the encoder too much.
+        #
+        # See if progress is in the same direction as the motor speed.
+        #
+        motor.encoder.get_position()
+        progress = motor.encoder.progress()
+        currentDirection = motor.currentDirection()
+        if (progress != currentDirection):
+            #
+            # Big problem, movement isn't matching what we're trying to do!
+            # Slam on the brakes.
+            #
+            EMERGENCY_STOP()
+            #
+            # We either moving when we should be stopped, stopped when we should
+            # be moving or we're moving in the wrong direction. Determine which
+            # problem it is, report and abort!
+            #
+            if (currentDirection):
+                #
+                # We either not moving or moving in the opposite direction we
+                # should be, report
+                #
+                if (progress):
+                    #
+                    # We're moving in the wrong direction
+                    #
+                    text = f'{motor.name} should be moving in a {display_movement(currentDirection)} direction, but moving in a {display_movement(progress)} direction'
+                    logging.critical(text)
+                else:
+                    #
+                    # We're not moving but we should be
+                    #
+                    text = f'{motor.name} should be moving in a {display_movement(currentDirection)} direction, but not moving'
+                    logging.critical(text)
+            else:
+                #
+                # We're moving when we should be stopped
+                #
+                text = f'{motor.name} should not be moving, but it is moving in a {display_movement(currentDirection)} direction'
+                logging.critical(text)
+            
+            #
+            # This continue will jump us to the bottom of the loop, at which
+            # point the abort flag should be set and we'll exit the routine.
+            #
+            EMERGENCY_STOP(text)
+            continue
+
+        #
+        # Everything is hunky-dory, let's see if we have work to do
+        #
+
+        #
+        # See if we have stop work
+        #
+        if (work is not None):
+            if (work == STOP):
+                #
+                # Set destination to the current position, which will cause
+                # setDestination to determine that we've arrived at our
+                # destination and stop the dish.
+                #
+                destination = encoder.position()
+
+            else:
+                #
+                # The only other work is a new destination, set it
+                #
+                (destination, event) = work
+
+        #
+        # Set the destination. This will set an appropriate speed and direction
+        # to the destination, depending on the distance to the destination from
+        # the current position. This will also stop the motor if we've arrived
+        # at the destination (speed of zero)
+        #
+        # Compute distance and direction to the destination
+        #
+        poll_interval = motor.setDestination(destination)
+
+        #
+        # Special code for STOP. Since STOP does not feather down to a stop,
+        # it's possible that we overshoot enough to cause the dish's position
+        # to be far enough away from the destination that it'll back up. We
+        # don't want that, so for STOP, once everything is stopped grab the
+        # current position (refresh by calling get_position) and set the
+        # destination to the current position to make sure we stay stopped.
+        #
+        if (work == STOP):
+            destination = motor.encoder.get_position()
+
+            #
+            # Release any process waiting on the axis to change motion
+            #
+            event.set()
+
+    logging.critical(f'Abort detected, {motor.name} AxisControl thread exiting')
+
+def EMERGENCY_STOP(text=None):
+
+    global first_detected_error, VFDrelay, AZenable, ELup, ELdown
+
+    logging.critical("EMERGENCY_STOP called, aborting all threads.")
+    #
+    # Just kill power to the dish by disabling the VFD.
+    #
+    # Setting optional debounce time to zero will cause the relay NOT to be
+    # checked for correct state, skipping the debounce time. This will allow us
+    # to open the all the relays in as little time as possible.
+    #
+    if (VFDrelay):
+        VFDrelay.off(0)
+
+    #
+    # Now turn off all motion control relays to stop the dish as quckly as
+    # possible. Elevation first since it has nearby physical stops it can run
+    # into.
+    #
+    # Setting optional debounce time to zero will cause the relay NOT to be
+    # checked for correct state, skipping the debounce time. This will allow us
+    # to open the all the relays in as little time as possible.
+    #
+    if (ELup):
+        ELup.off(0)
+    if (ELdown):
+        ELdown.off(0)
+    
+    if (AZenable):
+        AZenable.off(0)
+
+    #
+    # Now save (only) the first error text reported to EMERGENCY_STOP because
+    # that will be the root error that caused all the other (possible) calls to
+    # EMERGENCY_STOP
+    #
+    if (text and (not first_detected_error)):
+        first_detected_error = text
+
+def POWER_ON():
+    global AZqueue, ELqueue
+    
+    # Mke sure everything is stopped
+    ELqueue.put(STOP)
+    AZqueue.put(STOP)
+
+    # Allow everything to stop and settle down, then turn on the power
+    sleep(5)
+    VFDrelay.close()
+
+def POWER_OFF():
+    global AZqueue, ELqueue
+    ELqueue.put(STOP)
+    AZqueue.put(STOP)
+
+    # Allow everything to stop, then power stuff off.
+    sleep(5)
+    VFDrelay.open()
+
+def display_movement(value):
+    return (["-", "0", "+"][value + 1])
+
+manualPos = re.compile(r'(\+{1,2})')
+manualNeg = re.compile(r'(-{1,2})')
+azNumber = re.compile(r'([\+-]?\d{1,3}\.\d{0,3}|[\+-]?\d{0,3}\.\d{1,3})')
+
+################################################################################
+################################################################################
+#
+# Command line parsing and responses
+#
+################################################################################
+################################################################################
+
+def err(text):
+    return("ERROR " + text)
+
+def warn(text):
+    return("WARNING " + text)
+
+def fatal(text):
+    return("FATAL ERROR " + text)
+
+def axisInfo(motor, delay=3):
+
+    #
+    # Sleep three seconds before getting axis information so we can get the
+    # operation statrted so it reflects accurate information.
+    #
+    current_direction = motor.encoder.progress()
+
+    #
+    # +1 and -1 are printed as they are, 0 becomes " 0" to avoid "+0" for
+    # asthetics but keeping the field width the same.
+    #
+    current_direction = f'{current_direction:+2d}' if current_direction else " 0"
+
+    return(f'OK {motor.encoder.position():+08.3f} {current_direction} {motor.ETA():03d} {motor.destination:+08.3f} {motor.encoder.minimum:+08.3f} {motor.encoder.maximum:+08.3f}')
+
+def azNum(azimuth):
+    global AZqueue, AZmotor
+    
+    azimuth = float(azimuth)
+    if (azimuth < AZIMUTH_MINIMUM):
+        return("Error: Minimum azimuth is {AZIMUTH_MINIMUM}")
+    if (azimuth > AZIMUTH_MAXIMUM):
+        return("Error: Maximum azimuth is {AZIMUTH_MAXIMUM}")
+
+    #
+    # Setup lock that will blcok until the dish has stated moving in order to
+    # report valid information
+    #
+    axis_moving = threading.Event()
+
+    #
+    # Queue the work to start the axis moving
+    #
+    AZqueue.put((azimuth, axis_moving))
+
+    #
+    # Block until the axis is moving.
+    #
+    axis_moving.wait()
+
+    #
+    # Now return information about the axis
+    #
+    return (axisInfo(AZmotor))
+
+def azPos(speed):
+
+    # Not using the speed yet.
+    return(azNum(AZIMUTH_MAXIMUM))
+
+def azNeg(speed):
+
+    # Not using the speed yet.
+    return(azNum(AZIMUTH_MINIMUM))
+
+azParse = {
+    manualPos : azPos,
+    manualNeg : azNeg,
+    azNumber : azNum
+}
+
+def CMDazimuth(token):
+    global AZmotor, AZqueue
+
+    if (len(token) > 1):
+        #
+        # Only zero or one tokens can be supplied to the AZIMUTH command
+        #
+        return ('Error: Too many arguments specifed to the "AZIMUTH" command')
+
+    if (not token):
+        #
+        # There is nothing but the "AZIMUTH" command - return the current
+        # azimuth and motion.
+        #
+        return (axisInfo(AZmotor, 0))
+
+    #
+    # We have one token, get rid of the list.
+    #
+    token = token[0]
+
+    if (token == "STOP"[:len(token)]):
+        #
+        # Stop detected
+        #
+        AZqueue.put(STOP)
+        return (axisInfo(AZmotor))
+
+    #
+    # Now go looking for a match for the azimuth command argument
+    #
+    for regEx, dispatch in azParse.items():
+        match = regEx.match(token)
+        if (match):
+            return(dispatch(match.group(1)))
+
+    #
+    # We should always find a match in the above for loop. If not, we have a
+    # command syntax error.
+    #
+    return ("Error: Unrecognized argument to AZIMUTH command")
+
+elNumber = re.compile(r'([\+-]?\d{1,2}\.\d{0,3}|[\+-]?\d{0,2}\.\d{1,3})')
+
+def elNum(elevation):
+    global ELqueue, ELmotor
+
+    elevation = float(elevation)
+    if (elevation < ELEVATION_MINIMUM):
+        return("Error: Minimum Elevation is {AZIMUTH_MINIMUM}")
+    if (elevation > ELEVATION_MAXIMUM):
+        return("Error: Maximum Elevation is {AZIMUTH_MAXIMUM}")
+
+    
+
+    #
+    # Setup lock that will blcok until the dish has stated moving in order to
+    # report valid information
+    #
+    axis_moving = threading.Event()
+
+    #
+    # Queue the work to start the axis moving
+    #
+    ELqueue.put((elevation, axis_moving))
+
+    #
+    # Block until the axis is moving.
+    #
+    axis_moving.wait()
+
+    #
+    # Now return information about the axis
+    #
+    return (axisInfo(ELmotor))
+
+def elPos(speed):
+
+    # Not using the speed yet.
+    return(elNum(ELEVATION_MAXIMUM))
+
+def elNeg(speed):
+
+    # Not using the speed yet.
+    return(elNum(ELEVATION_MINIMUM))
+
+elParse = {
+    manualPos : elPos,
+    manualNeg : elNeg,
+    elNumber : elNum
+}
+
+def CMDelevation(token):
+    global ELmotor, ELqueue
+    if (len(token) > 1):
+        #
+        # Only zero or one tokens can be supplied to the AZIMUTH command
+        #
+        return ('Error: Too many arguments specifed to the "ELEVATION" command')
+
+    if (not token):
+        #
+        # There is nothing but the "ELEVATION" command - return the current
+        # elevation and motion. A call to progress will update the position to
+        # the current position. Do not delay, immediately get the position.
+        #
+        return (axisInfo(ELmotor, 0))
+
+    #
+    # We have one token, get rid of the list.
+    #
+    token = token[0]
+
+    if (token == "STOP"[:len(token)]):
+        #
+        # Stop detected
+        #
+        ELqueue.put(STOP)
+        return (axisInfo(ELmotor))
+
+    #
+    # Now go looking for a match for the elevation command argument
+    #
+    for regEx, dispatch in elParse.items():
+        match = regEx.match(token)
+        if (match):
+            return(dispatch(match.group(1)))
+
+    #
+    # We should always find a match in the above for loop. If not, we have a
+    # command syntax error.
+    #
+    return ("Error: Unrecognized argument to ELEVATION command")
+
+def CMDhelp(tokens, az, el):
+    return(HELP_TEXT)
+
+def CMDstop(az, el):
+    global AZqueue, ELqueue
+    #
+    # Stop both azimuth and elevation axes
+    #
+    el.work.put(STOP)
+    az.work.put(STOP)
+    return("OK")
+
+
+commands = {
+    "AZIMUTH" : CMDazimuth,
+    "ELEVATION" : CMDelevation,
+    "HELP" : CMDhelp,
+    "STOP" : CMDstop,
+    "?" : CMDhelp
+}
+
+def parseCommand(cmd, az, el):
+
+    dispatchList = list()
+    for command, dispatch in commands.items():
+        #
+        # Try and match abbreviated commands to as many commands as possible
+        #
+        if (cmd[0] == command[:len(cmd[0])]):
+            #
+            # This command was a match, save it in the dispatch list
+            #
+            dispatchList.append(dispatch)
+
+    if (not dispatchList):
+        #
+        # No command matched
+        #
+        return(f'Error: "{cmd[0]}" command not found. Try "HELP"')
+
+    if (len(dispatchList) > 1):
+        #
+        # More than one command matched
+        #
+        return(f'Error: "{cmd[0]}" ambiguous, specify more letters. Try "HELP" or "?"')
+    
+    #
+    # One command matched, dispatch to its parsing routine with the rest of the
+    # arguments, if any. Once complete, return the text returned from it.
+    #
+    return(dispatch(az, el, cmd[1:]))
+
+################################################################################
+################################################################################
+#
+# Get commands
+#
+################################################################################
+################################################################################
+
+def getCommands(az, el):
+    global first_detected_error
+
+    while(True):
+
+        # Make client address None so it's false.
+        client_address = None
+        # Create a socket object (AF_INET = IPv4, SOCK_STREAM = TCP)
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setblocking(True)
+
+        # Bind to '' (allows connections from any IP) and a port
+
+        server_socket.bind(('', DishSocket))
+
+        server_socket.listen(1)
+
+        logging.debug("Server is waiting for a connection...")
+
+        # Wait for a connection
+        (client_socket, client_address) = server_socket.accept()
+        client_socket.setblocking(True)
+                
+        logging.info(f"Connected to: {client_address}")
+
+        Dish.POWER_ON()
+
+        while (True):
+
+            # Block waiting for a command to come in
+            command = client_socket.recv(1024).decode().strip().upper()
+
+            logging.debug(f'COMMAND: {command}')
+
+            # If it's an exit command, we break the communicantion channel and
+            # start waiting for someone else to contact us.
+            if (command == "EXIT"):
+                break
+
+            splitUp = command.split()
+            if (len(splitUp)):
+                #
+                # We have some command to parse, parse it.
+                #
+                results = parseCommand(splitUp, az, el)
+            else:
+                #
+                # Blank line, just return nothing back (keepalive method?)
+                #
+                results = ""
+
+            #Find the command
+            for re_expression, dispatch in commands.items():
+                args = re_expression.match(command)
+                if (args):
+                    results = dispatch(args)
+                    break
+            else:
+                results = "ERROR: Command or command syntax not recognised"
+
+            if (results == "DISCONNECT"):
+                logging.debug("DISCONNECT command received")
+                break
+        
+            if (results == "EXIT"):
+                break
+
+            logging.info(f'RESULTS: {results}')
+            
+            # Send data, if you can't send, disconnect
+            try:
+                client_socket.send(results.encode())
+            except BrokenPipeError:
+                break
+
+        #We're exiting, power off the dish
+        Dish.POWER_OFF()
+
+        #Seems the only way to cleanly close the socket is to try a send first.
+        # Just ignore any errors.
+        try:
+            client_socket.send(''.encode())
+        except:
+            pass
+
+        client_socket.close()
+
+        server_socket.shutdown(socket.SHUT_RDWR)
+        server_socket.close();
+
+        logging.debug(f"Connnection with {client_address} closed")
+
+        if (command == "EXIT"):
+            text = "EXIT command received, exiting dish server"
+            logging.info(text)
+            EMERGENCY_STOP(text)
+            # Return to top-level of server program
+            return
+        self.progress = 1
+
+################################################################################
+################################################################################
+#
+# The main code. Set everything up and kick off the threads/processes here.
+#
+################################################################################
+################################################################################
+
+def main():
+    global VFDrelay, AZenable, ELup, ELdown, first_detected_error
+
+    VFDrelay = RELAY("VFD", VFD_RELAY)
+
+    #
+    # DAC initialization comes first so when the relays are tested the DAC voltages
+    # are at zero so nothing happens during the relay test (on and off).
+    #
+
+
+    #
+    # The azimuth motor is made up of the DAC and enable relay.
+    #
+    AZenable = RELAY("Azimuth enable", AZ_RELAY)
+    AZmotor = MOTOR_CONTROL_COPLEY(Encoder(AzimuthEncoder(ENCODER_NR25("Azimuth",
+                                                                        ENCODER_AZIMUTH_IP,
+                                                                        ENCODER_AZIMUTH_PORT,
+                                                                        AZIMUTH_ADJUSTMENT)),
+                                           AZIMUTH_MINIMUM,
+                                           AZIMUTH_MAXIMUM,
+                                           AZIMUTH_EXCURSION_ERROR),
+                                   DAC_GP8630N("Azimuth",
+                                                GP8630N_AZIMUTH_I2C,
+                                                i2cLock),
+                                   AZenable)
+
+    #
+    # Now that the DAC is set to zero voltage, test the azimuth relay
+    #
+    AZenable.test()
+
+    #
+    # The elevation motor is made up of the DAC and enable up and down relays
+    #
+    ELup = RELAY("Elevation up", ELUP_RELAY)
+    ELdown = RELAY("Elevation down", ELDN_RELAY)
+    ELmotor = MOTOR_CONTROL_ALLEN_BRADLEY(Encoder(ElevationEncoder(ENCODER_NR25("Elevation",
+                                                                                 ENCODER_ELEVATION_IP,
+                                                                                 ENCODER_ELEVATION_PORT,
+                                                                                 ELEVATION_ADJUSTMENT)),
+                                                  ELEVATION_MINIMUM,
+                                                  ELEVATION_MAXIMUM,
+                                                  ELEVATION_EXCURSION_ERROR),
+                                          DAC_GP8630N("Elevation",
+                                                       GP8630N_ELEVATION_I2C,
+                                                       i2cLock),
+                                          ELup,
+                                          ELdown)
+
+    #
+    # Now that the DAC is set to zero voltage, test the elevation relays
+    #
+    ELup.test()
+    ELdown.test()
+
+    #
+    # If we had any errors during initialization severe enough to set the abort
+    # flag, don't start anything at this point!
+    #
+    if (first_detected_error):
+        text = "Errors detected during initialization, aborting run"
+        logging.critical(text)
+        EMERGENCY_STOP(text)
+        exit(1)
+
+    #
+    # Create Azimuth work queue and start thread
+    #
+    AZprogress = Progress("Azimuth")
+    AZthread = threading.Thread(target=AxisControl, args=(AZmotor,))
+    AZthread.start()
+
+    #
+    # Create Elevation work queue and start thread
+    #
+    ELthread = threading.Thread(target=AxisControl, args=(ELmotor, ))
+    ELthread.start()
+
+    #
+    # Start work input command queue
+    #
+    CMDthread = threading.Thread(target=getCommands, args=(AZmotor, ELmotor))
+    CMDthread.start()
+
+    logging.info("Setup of DSES 60 foot dish complete")
+
+    #DishData = gdefs.DataFile(Path(__file__).name + '.dat')
+
+    #
+    # Monitor thread prgress and abort if hung
+    #
+    monitor = (AZprogress. ELprogress, CMDprogress)
+    last_progress = [0] * len(monitor)
+
+    while (not first_detected_error):
+        #
+        # Allow the other threads to run most of the time
+        #
+        sleep(10)
+
+        for _ in range(len(monitor)):
+            progress = monitor[_].progress
+            if (progress == last_progress[i]):
+                #
+                # A process is hung, kill everything. This will set the abort flag
+                # and get us out of the while loop.
+                #
+                text = f'{monitor[_].name} is hung'
+                logging.critical(text)
+                EMERGENCY_STOP(text)
+                break
+
+            #
+            # We made progress, update the progress
+            #
+            last_progress[i] = progress
+
+    #
+    # Something crashed, wait for all processes to exit
+    #
+    AZthread.join()
+    ELthread.join()
+    CMDthread.join()
+
+if (__name__ == "__main__"):
+    main()
+
+exit(0)
